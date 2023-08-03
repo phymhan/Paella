@@ -1,0 +1,11 @@
+models/
+logs/
+outputs/
+images/
+images
+*.png
+*.jpg
+arroz
+torchtools
+__pycache__
+*/__pycache__
