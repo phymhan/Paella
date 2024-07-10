@@ -19,19 +19,20 @@ max_iters = updates * grad_accum_steps
 print_every = 2000 * grad_accum_steps
 lr = 1e-4
 
-dataset_path = ""
+dataset_path = "/research/cbim/medical/lh599/data/LAION/laion-art/laion-high-resolution/"
 clip_model_name = ('ViT-H-14', 'laion2b_s32b_b79k')
 byt5_model_name = "google/byt5-xl"
-vqmodel_path = ""
-run_name = "Paella-ByT5-XL-v1"
+vqmodel_path = "models/vqgan_f4.pt"
+run_name = "Paella-ByT5-XL-0805"
 output_path = "output"
 os.makedirs(output_path, exist_ok=True)
 checkpoint_path = f"{run_name}.pt"
-wandv_project, wandb_run_name, wandv_entity = "", "", ""
+wandv_project, wandb_run_name, wandv_entity = "paella", "art", "ligongh"
 
 
 def train(gpu_id, world_size, n_nodes):
-    node_id = int(os.environ["SLURM_PROCID"])
+    # node_id = int(os.environ["SLURM_PROCID"])
+    node_id = 0
     main_node = gpu_id == 0 and node_id == 0
     ddp_setup(gpu_id, world_size, n_nodes, node_id)
     device = torch.device(gpu_id)
@@ -185,6 +186,6 @@ def train(gpu_id, world_size, n_nodes):
 
 if __name__ == '__main__':
     world_size = torch.cuda.device_count()
-    n_node = 16
+    n_node = 1
     mp.spawn(train, args=(world_size, n_node), nprocs=world_size)
     

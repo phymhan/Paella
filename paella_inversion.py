@@ -19,6 +19,11 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 
+def sample_gumbel(shape, eps=1e-20, device=device):
+    U = torch.rand(shape, device=device)
+    return -torch.log(-torch.log(U + eps) + eps)
+
+
 def showimages(imgs, rows=False, **kwargs):
     plt.figure(figsize=(kwargs.get("width", 32), kwargs.get("height", 32)))
     plt.axis("off")
@@ -35,6 +40,65 @@ def showimages(imgs, rows=False, **kwargs):
 
 def invert(model,
            x0,
+           lts,  # logits
+           model_inputs,
+           latent_shape,
+           unconditional_inputs=None,
+           init_x=None,
+           steps=12,
+           renoise_steps=None,
+           temperature=(0.7, 0.3),
+           cfg=(8.0, 8.0),
+           mode='multinomial',
+           t_start=1.0,
+           t_end=0.0,
+           attn_weights=None,
+           fixed_noise=True):
+    device = unconditional_inputs["byt5"].device
+    if renoise_steps is None:
+        renoise_steps = steps - 1
+    if unconditional_inputs is None:
+        unconditional_inputs = {
+            k: torch.zeros_like(v)
+            for k, v in model_inputs.items()
+        }
+    intermediate_images = []
+    gts = []
+    with torch.inference_mode():
+        init_noise = torch.randint(0,
+                                   model.num_labels,
+                                   size=latent_shape,
+                                   device=device)
+        if init_x != None:
+            sampled = init_x
+        else:
+            sampled = init_noise.clone()
+        t_list = torch.linspace(t_start, t_end, steps + 1)
+        temperatures = torch.linspace(temperature[0], temperature[1], steps)
+        cfgs = torch.linspace(cfg[0], cfg[1], steps)
+        for i, tv in enumerate(t_list[:steps]):
+            t = torch.ones(latent_shape[0], device=device) * tv
+
+            logits = model(sampled, t, **model_inputs, attn_weights=attn_weights)
+            if cfg is not None:
+                logits = logits * cfgs[i] + model(sampled, t, **unconditional_inputs) * (1 - cfgs[i])
+            
+            logits = logits.div(temperatures[i])
+            gt = lts[i+1] - logits
+            gts.append(gt)
+            logits = lts[i+1]
+            sampled = logits.argmax(dim=1)
+
+            intermediate_images.append(sampled)
+
+            if i < renoise_steps:
+                t_next = torch.ones(latent_shape[0], device=device) * t_list[i + 1]
+                sampled = model.add_noise(sampled, t_next, random_x=init_noise if fixed_noise else None)[0]
+                intermediate_images.append(sampled)
+    return sampled, intermediate_images
+
+
+def sample(model,
            model_inputs,
            latent_shape,
            unconditional_inputs=None,
@@ -80,86 +144,8 @@ def invert(model,
                 logits = logits * cfgs[i] + model(
                     sampled, t, **unconditional_inputs) * (1 - cfgs[i])
             
-            scores = logits.div(temperatures[i]).softmax(dim=1)  # [B, D, H, W]
-            sampled = scores.permute(0, 2, 3, 1).reshape(-1, logits.size(1))  # [BHW, D]
-            sampled = torch.multinomial(sampled, 1)[:,0].view(logits.size(0), *logits.shape[2:])
-
-            intermediate_images.append(sampled)
-
-            if i < renoise_steps:
-                t_next = torch.ones(latent_shape[0], device=device) * t_list[i + 1]
-                sampled = model.add_noise(sampled, t_next, random_x=init_noise if fixed_noise else None)[0]
-                intermediate_images.append(sampled)
-    return sampled, intermediate_images
-
-
-def sample(model,
-           model_inputs,
-           latent_shape,
-           unconditional_inputs=None,
-           init_x=None,
-           steps=12,
-           renoise_steps=None,
-           temperature=(0.7, 0.3),
-           cfg=(8.0, 8.0),
-           mode='multinomial',
-           t_start=1.0,
-           t_end=0.0,
-           sampling_conditional_steps=None,
-           sampling_quant_steps=None,
-           attn_weights=None,
-           fixed_noise=True):  # 'quant', 'multinomial', 'argmax'
-    device = unconditional_inputs["byt5"].device
-    if sampling_conditional_steps is None:
-        sampling_conditional_steps = steps
-    if sampling_quant_steps is None:
-        sampling_quant_steps = steps
-    if renoise_steps is None:
-        renoise_steps = steps - 1
-    if unconditional_inputs is None:
-        unconditional_inputs = {
-            k: torch.zeros_like(v)
-            for k, v in model_inputs.items()
-        }
-    intermediate_images = []
-    with torch.inference_mode():
-        init_noise = torch.randint(0,
-                                   model.num_labels,
-                                   size=latent_shape,
-                                   device=device)
-        if init_x != None:
-            sampled = init_x
-        else:
-            sampled = init_noise.clone()
-        t_list = torch.linspace(t_start, t_end, steps + 1)
-        temperatures = torch.linspace(temperature[0], temperature[1], steps)
-        cfgs = torch.linspace(cfg[0], cfg[1], steps)
-        for i, tv in enumerate(t_list[:steps]):
-            if i >= sampling_quant_steps:
-                mode = "quant"
-            t = torch.ones(latent_shape[0], device=device) * tv
-
-            logits = model(sampled,
-                           t,
-                           **model_inputs,
-                           attn_weights=attn_weights)
-            if cfg is not None and i < sampling_conditional_steps:
-                logits = logits * cfgs[i] + model(
-                    sampled, t, **unconditional_inputs) * (1 - cfgs[i])
-            scores = logits.div(temperatures[i]).softmax(dim=1)  # [B, D, H, W]
-
-            if mode == 'argmax':
-                sampled = logits.argmax(dim=1)
-            elif mode == 'multinomial':
-                sampled = scores.permute(0, 2, 3, 1).reshape(-1, logits.size(1))  # [BHW, D]
-                sampled = torch.multinomial(sampled, 1)[:,0].view(logits.size(0), *logits.shape[2:])
-            elif mode == 'quant':
-                sampled = scores.permute(0, 2, 3, 1) @ vqmodel.vquantizer.codebook.weight.data
-                sampled = vqmodel.vquantizer.forward(sampled, dim=-1)[-1]
-            else:
-                raise Exception(
-                    f"Mode '{mode}' not supported, use: 'quant', 'multinomial' or 'argmax'"
-                )
+            logits = logits.div(temperatures[i]) + sample_gumbel(logits.shape, device=device)
+            sampled = logits.argmax(dim=1)
 
             intermediate_images.append(sampled)
 
@@ -261,9 +247,9 @@ for imgs in images:
 input_image = load_image("images/cat_mirror.png")
 
 batch_size = 3
-prefix = '12'
+prefix = '0'
 # caption = "an image of a shiba inu, donning a spacesuit and helmet, traversing the uncharted terrain of a distant, extraterrestrial world, as a symbol of the intrepid spirit of exploration and the unrelenting curiosity that drives humanity to push beyond the bounds of the known"
-# caption = "an astronaut riding a horse on Mars"
+caption = "an astronaut riding a horse on Mars"
 # caption = "Art piece of a robot"
 # caption = "two cats doing research"
 # caption = "vibrant portrait painting of Salvador Dalí with a robotic half face"
@@ -275,7 +261,7 @@ prefix = '12'
 # caption = "a dolphin in an astronaut suit on saturn, artstation"
 # caption = "a propaganda poster depicting a cat dressed as french emperor napoleon holding a piece of cheese"
 # caption = "a teddy bear on a skateboard in times square"
-caption = "a cat sitting next to a mirror"
+# caption = "a cat sitting next to a mirror"
 t5, clip_text, clip_image = True, True, True  # decide which conditionings to use for the sampling
 use_prior = True  # whether to use generate clip image embeddings with the prior or to use image embeddings from given images defined in the cell above
 
@@ -383,7 +369,6 @@ with torch.inference_mode():
             t_start=1.0,
             t_end=0.0,
             mode=mode,
-            sampling_conditional_steps=None,
             attn_weights=attn_weights,
             fixed_noise=fixed_noise,)
 
